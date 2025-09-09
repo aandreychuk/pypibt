@@ -1,110 +1,203 @@
 import numpy as np
+from typing import Optional
 
-from .dist_table import DistTable
-from .mapf_utils import Config, Configs, Coord, Grid, get_neighbors
+from .dist_table import OrientedDistTable
+from .enums import (
+    Action, Orientation, Config, Grid, 
+    OrientedConfig, OrientedConfigs, OrientedCoord
+)
+from .mapf_utils import get_multi_action_operations, apply_action_sequence
+from .action_sequences import generate_unique_action_sequences
+from .task_manager import TaskManager
 
 
-class PIBT:
-    def __init__(self, grid: Grid, starts: Config, goals: Config, seed: int = 0):
+class MultiActionPIBT:
+    """PIBT variant that uses multi-action operations to better handle collision resolution."""
+    
+    def __init__(self, grid: Grid, starts: Config, task_manager: TaskManager, 
+                 operation_length: int = 3, seed: int = 0):
         self.grid = grid
-        self.starts = starts
-        self.goals = goals
+        # Convert starts to oriented coordinates (all agents start with orientation 0 - North)
+        self.starts: OrientedConfig = [(y, x, Orientation.NORTH) for y, x in starts]
         self.N = len(self.starts)
+        self.operation_length = operation_length
+        
+        # Task manager is mandatory for dynamic goal assignment
+        self.task_manager = task_manager
+        self.goals = self.task_manager.get_current_goals()
 
-        # distance table
-        self.dist_tables = [DistTable(grid, goal) for goal in goals]
+        # Pre-generate only unique, meaningful action sequences for this operation length
+        self.action_sequences = generate_unique_action_sequences(operation_length)
 
-        # cache
+        # distance table with orientation support
+        self.dist_tables = [OrientedDistTable(grid, goal) for goal in self.goals]
+
+        # cache - now needs to handle 3D coordinates (y, x, orientation)
         self.NIL = self.N  # meaning \bot
-        self.NIL_COORD: Coord = self.grid.shape  # meaning \bot
-        self.occupied_now = np.full(grid.shape, self.NIL, dtype=int)
-        self.occupied_nxt = np.full(grid.shape, self.NIL, dtype=int)
+        self.NIL_ORIENTED_COORD: OrientedCoord = (*self.grid.shape, -1)  # meaning \bot
 
         # used for tie-breaking
         self.rng = np.random.default_rng(seed)
+    
+    def _update_distance_tables(self):
+        """Update distance tables when goals change."""
+        self.dist_tables = [OrientedDistTable(self.grid, goal) for goal in self.goals]
 
-    def funcPIBT(self, Q_from: Config, Q_to: Config, i: int) -> bool:
-        # true -> valid, false -> invalid
-
-        # get candidate next vertices
-        C = [Q_from[i]] + get_neighbors(self.grid, Q_from[i])
-        self.rng.shuffle(C)  # tie-breaking, randomize
-        C = sorted(C, key=lambda u: self.dist_tables[i].get(u))
-
-        # vertex assignment
-        for v in C:
-            # avoid vertex collision
-            if self.occupied_nxt[v] != self.NIL:
-                continue
-
-            j = self.occupied_now[v]
-
-            # avoid edge collision
-            if j != self.NIL and Q_to[j] == Q_from[i]:
-                continue
-
-            # reserve next location
-            Q_to[i] = v
-            self.occupied_nxt[v] = i
-
-            # priority inheritance (j != i due to the second condition)
-            if (
-                j != self.NIL
-                and (Q_to[j] == self.NIL_COORD)
-                and (not self.funcPIBT(Q_from, Q_to, j))
-            ):
-                continue
-
-            return True
-
-        # failed to secure node
-        Q_to[i] = Q_from[i]
-        self.occupied_nxt[Q_from[i]] = i
+    def check_operation_collision(self, agent_id: int, operation_states: list[OrientedCoord], 
+                                  reserved_operations: dict[int, list[OrientedCoord]]) -> bool:
+        """Check if an operation collides with already reserved operations of other agents."""
+        # Check collision with each timestep of the operation
+        for t, state in enumerate(operation_states):
+            pos = (state[0], state[1])  # position only
+            
+            # Check if this position is occupied by another agent at this timestep
+            for other_agent, other_states in reserved_operations.items():
+                if other_agent == agent_id:
+                    continue
+                    
+                if t < len(other_states):
+                    other_pos = (other_states[t][0], other_states[t][1])
+                    if pos == other_pos:
+                        return True  # Collision detected
+                        
+            # Also check edge collisions (agents swapping positions)
+            if t > 0:
+                prev_pos = (operation_states[t-1][0], operation_states[t-1][1])
+                for other_agent, other_states in reserved_operations.items():
+                    if other_agent == agent_id:
+                        continue
+                    if t < len(other_states) and t-1 >= 0:
+                        other_pos = (other_states[t][0], other_states[t][1])
+                        other_prev_pos = (other_states[t-1][0], other_states[t-1][1])
+                        if pos == other_prev_pos and prev_pos == other_pos:
+                            return True  # Edge collision detected
+        
         return False
 
-    def step(self, Q_from: Config, priorities: list[float]) -> Config:
-        # setup
-        N = len(Q_from)
-        Q_to: Config = []
-        for i, v in enumerate(Q_from):
-            Q_to.append(self.NIL_COORD)
-            self.occupied_now[v] = i
+    def funcMultiActionPIBT(self, Q_from: OrientedConfig, reserved_operations: dict[int, list[OrientedCoord]], 
+                           visited_agents: set[int], i: int) -> bool:
+        """Multi-action PIBT function that can visit agents multiple times."""
+        
+        if i in visited_agents:
+            return True  # Already processed this agent in this round
+            
+        # Get all valid multi-action operations from current state using pre-computed sequences
+        operations = get_multi_action_operations(self.grid, Q_from[i], self.action_sequences)
+        
+        # Shuffle for tie-breaking
+        self.rng.shuffle(operations)
+        
+        # Sort by distance to goal (final state of operation)
+        operations = sorted(operations, key=lambda op: self.dist_tables[i].get(op[1]))
 
-        # perform PIBT
-        A = sorted(list(range(N)), key=lambda i: priorities[i], reverse=True)
+        # Try each operation
+        for action_sequence, final_state in operations:
+            # Get all states during this operation
+            operation_states = apply_action_sequence(Q_from[i], action_sequence)
+            
+            # Check for collisions with already reserved operations
+            if self.check_operation_collision(i, operation_states, reserved_operations):
+                continue
+            
+            # Check for collisions with agents that might need to be displaced
+            collision_agents = set()
+            for t, state in enumerate(operation_states):
+                pos = (state[0], state[1])
+                
+                # Find agents currently at this position
+                for j in range(self.N):
+                    if j == i or j in reserved_operations:
+                        continue
+                    
+                    current_pos = (Q_from[j][0], Q_from[j][1])
+                    if pos == current_pos:
+                        collision_agents.add(j)
+            
+            # Try to resolve collisions by recursively planning for conflicting agents
+            can_resolve = True
+            temp_visited = visited_agents.copy()
+            temp_visited.add(i)
+            
+            for j in collision_agents:
+                if not self.funcMultiActionPIBT(Q_from, reserved_operations, temp_visited, j):
+                    can_resolve = False
+                    break
+            
+            if can_resolve:
+                # Reserve this operation for agent i
+                reserved_operations[i] = operation_states
+                visited_agents.add(i)
+                return True
+        
+        # Could not find a valid operation
+        # Reserve stay operation as fallback
+        stay_states = apply_action_sequence(Q_from[i], [Action.WAIT] * self.operation_length)
+        reserved_operations[i] = stay_states
+        visited_agents.add(i)
+        return False
+
+    def step(self, Q_from: OrientedConfig, priorities: list[float]) -> OrientedConfig:
+        """Execute one multi-action step."""
+        # Reserved operations for each agent
+        reserved_operations: dict[int, list[OrientedCoord]] = {}
+        visited_agents: set[int] = set()
+        
+        # Sort agents by priority
+        A = sorted(list(range(self.N)), key=lambda i: priorities[i], reverse=True)
+        
+        # Plan operations for each agent
         for i in A:
-            if Q_to[i] == self.NIL_COORD:
-                self.funcPIBT(Q_from, Q_to, i)
-
-        # cleanup
-        for q_from, q_to in zip(Q_from, Q_to):
-            self.occupied_now[q_from] = self.NIL
-            self.occupied_nxt[q_to] = self.NIL
-
+            if i not in visited_agents:
+                self.funcMultiActionPIBT(Q_from, reserved_operations, visited_agents, i)
+        
+        # Execute first step of each agent's operation
+        Q_to = []
+        for i in range(self.N):
+            if i in reserved_operations and len(reserved_operations[i]) > 1:
+                Q_to.append(reserved_operations[i][1])  # First step of operation
+            else:
+                Q_to.append(Q_from[i])  # Stay in place
+        
         return Q_to
 
-    def run(self, max_timestep: int = 1000) -> Configs:
-        # define priorities
+    def run(self, max_timestep: int = 1000) -> OrientedConfigs:
+        """Run the multi-action PIBT algorithm with task management."""
+        # define priorities (based on oriented distance)
         priorities: list[float] = []
         for i in range(self.N):
-            priorities.append(self.dist_tables[i].get(self.starts[i]) / self.grid.size)
-
+            priorities.append(self.dist_tables[i].get(self.starts[i]) / (self.grid.size * 4))
+        print(self.starts)
         # main loop, generate sequence of configurations
         configs = [self.starts]
+        timestep = 0
+        
         while len(configs) <= max_timestep:
             # obtain new configuration
             Q = self.step(configs[-1], priorities)
             configs.append(Q)
+            timestep += 1
 
-            # update priorities & goal check
-            flg_fin = True
+            # Convert oriented positions to regular positions for task checking
+            current_positions = [(pos[0], pos[1]) for pos in Q]
+            print(timestep, Q, "\n")#self.goals)
+            # Check for completed tasks and get new assignments
+            completed_agents = self.task_manager.check_and_update_completed_tasks(current_positions, timestep)
+            
+            # Update goals if any tasks were completed
+            if completed_agents:
+                self.goals = self.task_manager.get_current_goals()
+                self._update_distance_tables()
+            
+            # Check if we should continue (task manager controls termination)
+            if not self.task_manager.has_active_tasks():
+                break
+            
+            # Update priorities based on current goals (which may have changed)
             for i in range(self.N):
-                if Q[i] != self.goals[i]:
-                    flg_fin = False
+                pos_q = (Q[i][0], Q[i][1])  # current position
+                if pos_q != self.goals[i]:
                     priorities[i] += 1
                 else:
                     priorities[i] -= np.floor(priorities[i])
-            if flg_fin:
-                break  # goal
 
         return configs
