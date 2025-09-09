@@ -35,8 +35,8 @@ class TaskManager:
         self.num_agents = num_agents
         self.cycle_tasks = cycle_tasks
         
-        # Current assignments: agent_id -> (task_id, y, x)
-        self.current_assignments: Dict[int, Tuple[int, int, int]] = {}
+        # Current assignments: agent_id -> (internal_task_id, original_task_id, y, x)
+        self.current_assignments: Dict[int, Tuple[int, int, int, int]] = {}
         
         # Task assignment history for logging
         self.assignment_history: List[Tuple[int, int, str, int]] = []  # (task_id, agent_id, action, timestep)
@@ -53,16 +53,18 @@ class TaskManager:
         # Initial assignment
         self._assign_initial_tasks()
     
-    def _assign_initial_tasks(self):
+    def _assign_initial_tasks(self, logger=None):
         """Assign initial tasks to all agents using round-robin."""
         for agent_id in range(self.num_agents):
-            self._assign_next_task_to_agent(agent_id)
+            self._assign_next_task_to_agent(agent_id, 0, logger)
     
-    def _assign_next_task_to_agent(self, agent_id: int, timestep: int = 0) -> bool:
+    def _assign_next_task_to_agent(self, agent_id: int, timestep: int = 0, logger=None) -> bool:
         """Assign the next task to a specific agent.
         
         Args:
             agent_id: ID of the agent to assign task to
+            timestep: Current timestep
+            logger: Optional logger to add assignment events and tasks to
             
         Returns:
             True if a task was assigned, False if no tasks available
@@ -92,13 +94,18 @@ class TaskManager:
             
             # For internal tracking, use a unique ID that includes cycle info
             cycles_for_this_task = self.next_task_indices[agent_id] // len(self.task_pool)
-            internal_unique_id = original_task_id + (cycles_for_this_task * 1000)  # Internal unique ID
+            internal_unique_id = original_task_id + (cycles_for_this_task * len(self.task_pool))
             
-            # Store with internal unique ID for assignment tracking
-            self.current_assignments[agent_id] = (internal_unique_id, y, x)
+            # Store both internal and original task IDs for clean tracking
+            self.current_assignments[agent_id] = (internal_unique_id, original_task_id, y, x)
             
             # Log the assignment using the ORIGINAL task ID (not inflated)
             self.assignment_history.append((original_task_id, agent_id, "assigned", timestep))
+            
+            # Add to logger if provided
+            if logger:
+                logger.add_event(original_task_id, agent_id, "assigned", timestep)
+                logger.add_task(original_task_id, y, x)
             
             # Update the next task index for this agent
             self.next_task_indices[agent_id] += self.num_agents
@@ -116,7 +123,7 @@ class TaskManager:
         goals = []
         for agent_id in range(self.num_agents):
             if agent_id in self.current_assignments:
-                _, y, x = self.current_assignments[agent_id]
+                _, _, y, x = self.current_assignments[agent_id]
                 goals.append((y, x))
             else:
                 # No task assigned, use some default position or None
@@ -124,11 +131,13 @@ class TaskManager:
         
         return goals
     
-    def check_and_update_completed_tasks(self, current_positions: Config, timestep: int = 0) -> List[int]:
+    def check_and_update_completed_tasks(self, current_positions: Config, timestep: int = 0, logger=None) -> List[int]:
         """Check if any agents have reached their goals and assign new tasks.
         
         Args:
             current_positions: Current positions of all agents [(y, x), ...]
+            timestep: Current timestep
+            logger: Optional logger to add task events and used tasks to
             
         Returns:
             List of agent IDs that completed tasks this timestep
@@ -137,24 +146,27 @@ class TaskManager:
         
         for agent_id in range(min(len(current_positions), self.num_agents)):
             if agent_id in self.current_assignments:
-                internal_task_id, goal_y, goal_x = self.current_assignments[agent_id]
+                internal_task_id, original_task_id, goal_y, goal_x = self.current_assignments[agent_id]
                 agent_y, agent_x = current_positions[agent_id]
                 
                 # Check if agent reached the goal
                 if agent_y == goal_y and agent_x == goal_x:
-                    # Extract the original task ID (remove cycle offset)
-                    original_task_id = internal_task_id % 1000
                     
                     # Mark task as completed with original ID
                     self.completed_tasks.append((original_task_id, goal_y, goal_x))
                     self.assignment_history.append((original_task_id, agent_id, "finished", timestep))
                     completed_agents.append(agent_id)
                     
+                    # Add to logger if provided
+                    if logger:
+                        logger.add_event(original_task_id, agent_id, "finished", timestep)
+                        logger.add_task(original_task_id, goal_y, goal_x)
+                    
                     # Remove current assignment
                     del self.current_assignments[agent_id]
                     
                     # Assign new task if available
-                    self._assign_next_task_to_agent(agent_id, timestep)
+                    self._assign_next_task_to_agent(agent_id, timestep, logger)
         
         return completed_agents
     
@@ -165,9 +177,13 @@ class TaskManager:
             agent_id: ID of the agent
             
         Returns:
-            Current task (task_id, y, x) or None if no task assigned
+            Current task (internal_task_id, y, x) or None if no task assigned
         """
-        return self.current_assignments.get(agent_id)
+        assignment = self.current_assignments.get(agent_id)
+        if assignment:
+            internal_task_id, original_task_id, y, x = assignment
+            return (internal_task_id, y, x)  # Return internal ID for compatibility
+        return None
     
     def get_assignment_events(self) -> List[List]:
         """Get all assignment events for logging.
@@ -176,6 +192,14 @@ class TaskManager:
             List of events in format [[task_id, agent_id, "action"], ...]
         """
         return [[task_id, agent_id, action, timestep] for task_id, agent_id, action, timestep in self.assignment_history]
+    
+    
+    def log_initial_assignments(self, logger):
+        """Log the initial task assignments that were made during initialization."""
+        if logger:
+            for agent_id, (internal_task_id, original_task_id, y, x) in self.current_assignments.items():
+                logger.add_event(original_task_id, agent_id, "assigned", 0)  # Initial assignments at timestep 0
+                logger.add_task(original_task_id, y, x)
     
     def get_all_tasks_for_logging(self) -> List[List]:
         """Get all tasks in logging format.

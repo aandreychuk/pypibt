@@ -10,6 +10,7 @@ from pypibt import (
     is_valid_oriented_mapf_solution,
     save_oriented_configs_for_visualizer,
     oriented_config_to_config,
+    SolutionVerifier,
 )
 
 if __name__ == "__main__":
@@ -55,6 +56,7 @@ if __name__ == "__main__":
     parser.add_argument("--enable-logging", action="store_true", help="Enable JSON logging")
     parser.add_argument("--log-file", type=str, default="pibt_results.json", help="Log file path")
     parser.add_argument("--cycle-tasks", action="store_true", help="Enable task cycling (default: True)", default=True)
+    parser.add_argument("--disable-verification", action="store_true", help="Disable solution verification")
     args = parser.parse_args()
 
     # Load grid, agents, and tasks
@@ -86,7 +88,9 @@ if __name__ == "__main__":
         grid=grid,
         starts=starts,
         task_manager=task_manager,
-        seed=args.seed
+        seed=args.seed,
+        enable_logging=args.enable_logging,
+        enable_verification=not args.disable_verification
     )
     
     print(f"Using TaskManager with {len(task_manager.task_pool)} tasks")
@@ -105,7 +109,8 @@ if __name__ == "__main__":
     print(f"Initialized MultiActionPIBT with {pibt.N} agents")
     
     # Run the algorithm
-    oriented_plan = pibt.run(max_timestep=args.max_timestep)
+    log_filepath = args.log_file if args.enable_logging else None
+    oriented_plan = pibt.run(max_timestep=args.max_timestep, log_filepath=log_filepath)
     
     # Get final positions
     final_positions = [(pos[0], pos[1]) for pos in oriented_plan[-1]]
@@ -136,13 +141,15 @@ if __name__ == "__main__":
     print(f"Results saved to: {args.output_file}")
     
     if args.enable_logging:
-        print(f"Note: Task manager logging could be implemented using task_manager.get_assignment_events()")
         events = pibt.task_manager.get_assignment_events()
-        print(f"\nSample task assignment events (first 10):")
-        for i, event in enumerate(events):
+        print(f"\nTask assignment events logged: {len(events)}")
+        print(f"Sample task assignment events (first 10):")
+        for i, event in enumerate(events[:10]):
             if len(event) >= 4:
                 task_id, agent_id, action, timestep = event
                 print(f"  {i+1}. Timestep {timestep}: Task {task_id} {action} to/by agent {agent_id}")
             else:
                 task_id, agent_id, action = event[:3]
                 print(f"  {i+1}. Task {task_id} {action} to/by agent {agent_id}")
+        
+        print(f"\nFull logging results saved to: {args.log_file}")

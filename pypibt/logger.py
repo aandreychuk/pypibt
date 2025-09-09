@@ -26,8 +26,9 @@ class PIBTLogger:
         self.actionModel = actionModel
         self.start_time: Optional[float] = None
         self.planner_times: list[float] = []
-        self.tasks: list[list] = []  # Format: [[id, y, x], ...]
-        self.events: list[list] = []  # Format: [[[task_id, agent_id, "action"], ...], ...] - nested by agent
+        self.tasks: dict[int, tuple[int, int]] = {}  # Format: {task_id: (y, x), ...}
+        self.max_task_id: int = -1  # Track maximum task ID seen
+        self.events_by_agent: dict[int, list[list]] = {}  # Format: {agent_id: [[task_id, agent_id, "action"], ...], ...}
         
     def start_timing(self):
         """Start timing the planning process."""
@@ -50,37 +51,81 @@ class PIBTLogger:
             y: Y coordinate of the task location
             x: X coordinate of the task location
         """
-        task = [task_id, y, x]
-        if task not in self.tasks:
-            self.tasks.append(task)
+        self.tasks[task_id] = (y, x)
+        self.max_task_id = max(self.max_task_id, task_id)
     
-    def add_event(self, task_id: int, agent_id: int, action: str):
+    def add_event(self, task_id: int, agent_id: int, action: str, timestep: int = 0):
         """Add an event to the logger.
         
         Args:
             task_id: ID of the task related to this event
             agent_id: ID of the agent performing the action  
             action: Type of action ("assigned", "finished", etc.)
+            timestep: Timestep when the event occurred (kept for compatibility)
         """
         event = [task_id, agent_id, action]
-        self.events.append(event)
+        if agent_id not in self.events_by_agent:
+            self.events_by_agent[agent_id] = []
+        self.events_by_agent[agent_id].append(event)
     
     def set_events_by_agent(self, events_by_agent: dict):
         """Set events organized by agent.
         
         Args:
             events_by_agent: Dictionary mapping agent_id to list of events
+                            Format: {agent_id: [(task_id, agent_id, action, timestep), ...]}
         """
-        self.events = []
-        # Add events for each agent in order
-        for agent_id in sorted(events_by_agent.keys()):
-            agent_events = [[task_id, timestep, action] for task_id, agent_id, action, timestep in events_by_agent[agent_id]]
-            self.events.append(agent_events)
+        self.events_by_agent = {}
+        # Organize events by agent
+        for agent_id in events_by_agent.keys():
+            self.events_by_agent[agent_id] = []
+            for task_id, agent_id, action, timestep in events_by_agent[agent_id]:
+                self.events_by_agent[agent_id].append([task_id, agent_id, action])
     
     def clear_tasks_and_events(self):
         """Clear all tasks and events."""
-        self.tasks = []
-        self.events = []
+        self.tasks = {}
+        self.max_task_id = -1
+        self.events_by_agent = {}
+    
+    def get_events_by_agent(self) -> list[list]:
+        """Get events organized by agent as nested lists.
+        
+        Returns:
+            List of lists where each sublist contains events for an agent.
+            Only includes agents that have events (no empty lists).
+        """
+        if not self.events_by_agent:
+            return []
+        
+        # Sort agent IDs and create nested list structure
+        events_nested = []
+        for agent_id in sorted(self.events_by_agent.keys()):
+            if self.events_by_agent[agent_id]:  # Only add non-empty agent event lists
+                events_nested.append(self.events_by_agent[agent_id])
+        
+        return events_nested
+    
+    def get_complete_task_list(self) -> list[list]:
+        """Get complete task list from 0 to max_task_id in ascending order.
+        
+        Returns:
+            List of tasks in format [[task_id, y, x], ...] for all task IDs from 0 to max_task_id.
+            Missing task IDs will have coordinates [0, 0] as placeholders.
+        """
+        if self.max_task_id < 0:
+            return []
+        
+        complete_tasks = []
+        for task_id in range(self.max_task_id + 1):
+            if task_id in self.tasks:
+                y, x = self.tasks[task_id]
+                complete_tasks.append([task_id, y, x])
+            else:
+                # Placeholder for missing task IDs
+                complete_tasks.append([task_id, 0, 0])
+        
+        return complete_tasks
     
     def format_start_positions(self, starts: Union[Config, OrientedConfig]) -> list[list]:
         """Format start positions for JSON output.
@@ -225,10 +270,11 @@ class PIBTLogger:
             "teamSize": team_size,
             "start": start_positions,
             "actualPaths": actual_paths,
+            "plannerPaths": actual_paths.copy(),  # Same as actualPaths
             "plannerTimes": self.planner_times.copy(),
             "errors": [],  # Left empty as requested
-            "events": self.events.copy(),  # Now populated with actual events
-            "tasks": self.tasks.copy()     # Now populated with actual tasks
+            "events": self.get_events_by_agent(),  # Events organized by agent
+            "tasks": self.get_complete_task_list()  # Complete task list from 0 to max_task_id
         }
         
         return log_entry

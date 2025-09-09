@@ -23,6 +23,7 @@ TaskPIBT = MultiActionPIBT
 from .dist_table import DistTable, OrientedDistTable
 from .logger import PIBTLogger
 from .task_manager import TaskManager
+from .solution_verifier import SolutionVerifier, ValidationError
 
 __all__ = [
     "get_grid",
@@ -47,4 +48,6 @@ __all__ = [
     "OrientedDistTable",
     "PIBTLogger",
     "TaskManager",
+    "SolutionVerifier",
+    "ValidationError",
 ]
